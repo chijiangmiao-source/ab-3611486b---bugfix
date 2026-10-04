@@ -12,6 +12,14 @@ Uninitialized objects are tracked by the identity (bytecode offset) of the
 `new` instruction that created them.  Before <init> completes they must not
 cross an exception edge into a handler, nor merge with initialized references
 or with uninitialized instances of a different identity.
+
+Legacy (old-javac) subroutines are supported too: `jsr`/`jsr_w` push a
+returnAddress identifying the instruction after the call, the shared cleanup
+segment stores it with `astore`, and `ret` returns through the saved
+address(es).  When several call sites share one cleanup segment the
+returnAddress local carries the *set* of possible continuation offsets, so
+`ret` resumes at every call site; nested subroutines simply use separate
+locals (and hence separate sets).
 """
 from __future__ import annotations
 
@@ -51,8 +59,19 @@ def UNINIT(offset, cls):
     return ("uninit", offset, cls)
 
 
+# Legacy subroutine return address.  `targets` is the tuple of instruction
+# offsets the owning `ret` may resume at (the instruction after each jsr that
+# can reach this value); a single-call value carries exactly one target.
+def RETADDR(targets):
+    return ("retaddr", tuple(sorted(set(targets))))
+
+
 def is_uninit(t):
     return t[0] == "uninit"
+
+
+def is_retaddr(t):
+    return t[0] == "retaddr"
 
 
 def is_reflike(t):
@@ -69,6 +88,8 @@ def fmt(t) -> str:
         return f"ref {t[1]}"
     if tag == "uninit":
         return f"uninit(new@{t[1]} {t[2]})"
+    if tag == "retaddr":
+        return "returnAddress(" + ",".join(str(x) for x in t[1]) + ")"
     return str(t)
 
 
@@ -86,6 +107,10 @@ def merge_types(a, b):
         # No class hierarchy is available (single class, no field/method
         # resolution); java/lang/Object is a sound common supertype.
         return a if a[1] == b[1] else REF("java/lang/Object")
+    if a[0] == "retaddr" and b[0] == "retaddr":
+        # Same local used by different call sites (or by nested subroutines):
+        # the owning ret may resume at the union of all continuation points.
+        return RETADDR(set(a[1]) | set(b[1]))
     # uninitialized objects merge only with an identical identity (handled
     # by the a == b case above); anything else is incompatible.
     return None
@@ -329,7 +354,7 @@ def disasm(insn: Insn, cf: ClassFile) -> str:
             return f"{n} {insn.offset + insn.operands[0]}"
         if n in ("bipush", "sipush"):
             return f"{n} {insn.operands[0]}"
-        if n in ("iload", "aload", "istore", "astore"):
+        if n in ("iload", "aload", "istore", "astore", "ret"):
             return f"{n} {insn.operands[0]}"
         if n == "iinc":
             return f"iinc {insn.operands[0]} {insn.operands[1]}"
@@ -503,7 +528,6 @@ class MethodVerifier:
                 err("type-mismatch",
                     f"{n} expects a reference, found {fmt(t)}")
             return t
-
         def load(i):
             if i >= ca.max_locals:
                 err("local-index-out-of-range",
@@ -583,7 +607,8 @@ class MethodVerifier:
             if not (is_reflike(t) or is_uninit(t)):
                 err("type-mismatch",
                     f"aload expects local {i} to be a reference, found "
-                    f"{fmt(t)}")
+                    f"{fmt(t)} (a subroutine return address must only be "
+                    f"used by ret)")
             push(t)
             return via_fall()
         if n.startswith("istore"):
@@ -594,9 +619,12 @@ class MethodVerifier:
         if n.startswith("astore"):
             i = insn.operands[0] if insn.operands else int(n[-1])
             t = pop()
-            if not (is_reflike(t) or is_uninit(t)):
+            # astore is also how a cleanup segment saves the returnAddress
+            # pushed by jsr/jsr_w.
+            if not (is_reflike(t) or is_uninit(t) or is_retaddr(t)):
                 err("type-mismatch",
-                    f"astore expects a reference, found {fmt(t)}")
+                    f"astore expects a reference or returnAddress, found "
+                    f"{fmt(t)}")
             store(i, t)
             return via_fall()
         if n == "iinc":
@@ -645,6 +673,37 @@ class MethodVerifier:
             return via_branch()
         if n in ("goto", "goto_w"):
             return [(branch_target(), out())]
+        if n in ("jsr", "jsr_w"):
+            # Legacy shared cleanup segment: push the continuation (the
+            # instruction after this jsr) as a returnAddress and enter the
+            # segment; the matching astore/ret pair comes back here.
+            target = branch_target()
+            cont = pc + insn.size
+            if cont not in self.insns:
+                err("bad-branch-target",
+                    f"{n} return address {cont} is not the start of an "
+                    f"instruction (the continuation after the call must be "
+                    f"reachable by ret)")
+            push(RETADDR((cont,)))
+            return [(target, out())]
+        if n == "ret":
+            i = insn.operands[0]
+            t = load(i)
+            if not is_retaddr(t):
+                err("bad-return-address",
+                    f"ret uses local {i} but it holds {fmt(t)}, not a "
+                    f"returnAddress saved by jsr/jsr_w; the continuation "
+                    f"offset of the shared cleanup segment was not saved")
+            # Anything left on the stack below the (already saved) address is
+            # the caller's own stack and carries back to every continuation.
+            succ = []
+            for tgt in t[1]:
+                if tgt not in self.insns:
+                    err("bad-return-address",
+                        f"ret would resume at offset {tgt}, which is not the "
+                        f"start of an instruction (no matching call site)")
+                succ.append((tgt, out()))
+            return succ
 
         # -- object creation / initialization
         if n == "new":

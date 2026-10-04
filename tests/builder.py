@@ -216,3 +216,110 @@ def uninitialized_escape_class():
     b.add_method("run", a.build(), max_stack=2, max_locals=1,
                  exceptions=[(0, 10, 10, 0)])
     return b.build()
+
+
+# ---------------------------------------------------------------------------
+# Legacy (old-javac) subroutine fixtures: jsr/jsr_w + astore + ret shared
+# cleanup segments, the idiom emitted for finally blocks before JSR 4539133.
+# ---------------------------------------------------------------------------
+
+def legacy_jsr_cleanup_class():
+    """Legal old-compiler control flow: TWO call sites reuse ONE cleanup
+    segment.  Call site B is the entry of an exception handler (a legal path
+    directly adjacent to the exception table); call site A is normal flow.
+
+      0 jsr C        ; call site A, saves continuation 3
+      3 return
+      4 pop          ; handler H: discard the caught Throwable
+      5 jsr C        ; call site B, saves continuation 8
+      8 goto END
+     11 C: astore_1  ; shared cleanup entry: save returnAddress
+     12 nop          ; cleanup work
+     13 ret 1        ; resume at 3 or 8
+     15 END: return
+
+    Exception table: [0,3) -> 4 catch-all (does not cover the cleanup).
+    """
+    b = ClassBuilder("LegacyCleanup")
+    a = Asm()
+    a.branch(0xA8, "c")     # 0 jsr c   (3 bytes, continuation = 3)
+    a.op(0xB1)              # 3 return
+    a.label("h")            # 4 handler entry
+    a.op(0x57)              # 4 pop
+    a.branch(0xA8, "c")     # 5 jsr c   (3 bytes, continuation = 8)
+    a.branch(0xA7, "end")   # 8 goto end
+    a.label("c")            # 11 shared cleanup entry
+    a.op(0x4C)              # 11 astore_1
+    a.op(0x00)              # 12 nop
+    a.op(0xA9, 0x01)        # 13 ret 1
+    a.label("end")          # 15
+    a.op(0xB1)              # 15 return
+    b.add_method("run", a.build(), max_stack=1, max_locals=2,
+                 exceptions=[(0, 3, 4, 0)])
+    return b.build()
+
+
+def legacy_jsr_wide_class():
+    """Legal old-compiler control flow with a WIDE displacement: jsr_w at
+    offset 0 reaches a cleanup segment 32770 bytes away (outside signed
+    int16 range), saves continuation 5 with astore, and ret comes back.
+
+      0 jsr_w C      ; 5 bytes, continuation = 5
+      5 return
+      6 .. 32769 nop ; unreachable linear padding (valid instruction bytes)
+      32770 astore_1
+      32771 ret 1
+    """
+    target = 32770
+    a = Asm()
+    a.branch(0xC9, "c", wide=True)  # 0 jsr_w c
+    a.op(0xB1)                      # 5 return
+    for _ in range(target - a.pc):  # 6 .. target-1
+        a.op(0x00)                  # nop
+    a.label("c")                    # 32770
+    a.op(0x4C)                      # 32770 astore_1
+    a.op(0xA9, 0x01)                # 32771 ret 1
+    b = ClassBuilder("LegacyWide")
+    b.add_method("run", a.build(), max_stack=1, max_locals=2)
+    return b.build()
+
+
+def legacy_nested_cleanup_class():
+    """Legal nested cleanup segments: the outer segment calls an inner one;
+    the two return addresses live in distinct locals.
+
+      0 jsr A        ; saves continuation 3 in local 1
+      3 return
+      4 A: astore_1
+      5 jsr B       ; saves continuation 8 in local 2
+      8 ret 1       ; inner cleanup returns here, outer ret resumes at 3
+     10 B: astore_2
+     11 nop
+     12 ret 2
+    """
+    b = ClassBuilder("LegacyNested")
+    a = Asm()
+    a.branch(0xA8, "a")     # 0 jsr a
+    a.op(0xB1)              # 3 return
+    a.label("a")            # 4 outer cleanup entry
+    a.op(0x4C)              # 4 astore_1
+    a.branch(0xA8, "b")     # 5 jsr b
+    a.op(0xA9, 0x01)        # 8 ret 1
+    a.label("b")            # 10 inner cleanup entry
+    a.op(0x4D)              # 10 astore_2
+    a.op(0x00)              # 11 nop
+    a.op(0xA9, 0x02)        # 12 ret 2
+    b.add_method("run", a.build(), max_stack=1, max_locals=3)
+    return b.build()
+
+
+def bad_return_address_class():
+    """Rejected old-compiler class: ret uses a local that never received a
+    jsr/jsr_w return address (it is `top`).  First evidence at offset 0."""
+    b = ClassBuilder("LegacyBadRet")
+    code = bytes([
+        0xA9, 0x01,   # 0 ret 1   (local 1 holds no saved return address)
+        0xB1,         # 2 return
+    ])
+    b.add_method("run", code, max_stack=1, max_locals=2)
+    return b.build()

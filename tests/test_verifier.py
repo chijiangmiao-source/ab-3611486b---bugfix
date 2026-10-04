@@ -8,7 +8,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.verifier import verify_class  # noqa: E402
 from builder import (ACC_PUBLIC, ACC_STATIC, Asm, ClassBuilder,  # noqa: E402
-                     legal_construction_class, uninitialized_escape_class)
+                     bad_return_address_class,
+                     legacy_jsr_cleanup_class, legacy_jsr_wide_class,
+                     legacy_nested_cleanup_class, legal_construction_class,
+                     uninitialized_escape_class)
 
 DIAG = "com/acme/Diag"
 
@@ -207,6 +210,115 @@ class LegalPathTests(unittest.TestCase):
         b.add_method("run", a.build(), max_stack=2, max_locals=0)
         res = verify_class(b.build())
         self.assertTrue(res["ok"], res.get("error"))
+
+
+class LegacySubroutineTests(unittest.TestCase):
+    """Old-javac jsr/jsr_w + astore + ret shared cleanup segments."""
+
+    def test_two_call_sites_share_one_cleanup_segment(self):
+        res = verify_class(legacy_jsr_cleanup_class())
+        self.assertTrue(res.get("ok"), res.get("error"))
+        # The two call sites (jsr at 0 and 5), the cleanup entry (11), the
+        # saved-continuation store (11), the ret (13) and both return points
+        # (3 and 15) all carry a reviewable incoming frame.
+        offsets = {s["offset"]: s for s in res["states"]}
+        for off in (0, 3, 4, 5, 8, 11, 13, 15):
+            self.assertIn(off, offsets)
+            self.assertTrue(offsets[off]["reachable"],
+                            f"offset {off} should be reachable")
+        # The two jsr calls converge at the cleanup entry; the incoming
+        # returnAddress is therefore the set {3, 8} of both continuations.
+        self.assertEqual(offsets[11]["stack"], ["returnAddress(3,8)"])
+        self.assertEqual(offsets[11]["locals"][:2], ["top", "top"])
+        # astore_1 saves it; ret 1 resumes at both continuations.
+        self.assertEqual(offsets[13]["locals"][1], "returnAddress(3,8)")
+        # Handler (call site B) entry state: caught Throwable on the stack.
+        h = res["handlers"][0]
+        self.assertEqual((h["start_pc"], h["end_pc"], h["handler_pc"]),
+                         (0, 3, 4))
+        self.assertEqual(h["stack"], ["ref java/lang/Throwable"])
+        self.assertTrue(h["reachable"])
+        # Both return points converge with identical empty stacks.
+        self.assertEqual(offsets[3]["stack"], [])
+        self.assertEqual(offsets[15]["stack"], [])
+        self.assertEqual(offsets[8]["stack"], [])
+
+    def test_jsr_w_wide_displacement_passes(self):
+        res = verify_class(legacy_jsr_wide_class())
+        self.assertTrue(res.get("ok"), res.get("error"))
+        offsets = {s["offset"]: s for s in res["states"]}
+        # Continuation 5, cleanup entry 32770 and the ret are all reachable.
+        for off in (0, 5, 32770, 32771):
+            self.assertIn(off, offsets)
+            self.assertTrue(offsets[off]["reachable"],
+                            f"offset {off} should be reachable")
+        self.assertEqual(offsets[32770]["stack"], ["returnAddress(5)"])
+        self.assertEqual(offsets[32771]["locals"][1], "returnAddress(5)")
+        # The linear padding is never executed (no fall-through from the jsr).
+        self.assertFalse(offsets[6]["reachable"])
+
+    def test_nested_cleanup_segments_passes(self):
+        res = verify_class(legacy_nested_cleanup_class())
+        self.assertTrue(res.get("ok"), res.get("error"))
+        offsets = {s["offset"]: s for s in res["states"]}
+        for off in (0, 3, 4, 5, 8, 10, 12):
+            self.assertIn(off, offsets)
+            self.assertTrue(offsets[off]["reachable"],
+                            f"offset {off} should be reachable")
+        # Outer segment saved in local 1, inner segment in local 2.
+        self.assertEqual(offsets[8]["locals"][1], "returnAddress(3)")
+        self.assertEqual(offsets[12]["locals"][2], "returnAddress(8)")
+        self.assertEqual(offsets[12]["locals"][1], "returnAddress(3)")
+
+    def test_ret_without_saved_return_address_rejected(self):
+        res = verify_class(bad_return_address_class())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "bad-return-address")
+        self.assertEqual(res["error"]["offset"], 0)
+
+    def test_ret_local_out_of_range_rejected(self):
+        b = ClassBuilder()
+        b.add_method("run", bytes([
+            0xA8, 0x00, 0x04,  # 0 jsr 7
+            0xB1,              # 3 return
+            0x4B,              # 4 astore_0
+            0xA9, 0x05,        # 5 ret 5 (index 5 >= max_locals)
+        ]), max_stack=1, max_locals=2)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "local-index-out-of-range")
+        self.assertEqual(res["error"]["offset"], 5)
+
+    def test_jsr_target_into_instruction_middle_rejected(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.branch(0xA8, "mid")   # 0 jsr mid
+        a.op(0x11)              # 3 sipush ...
+        a.label("mid")          # 4 (middle of the 16-bit immediate)
+        a.u2(0x1234)
+        a.op(0x4C)              # 6 astore_1
+        a.op(0xA9, 0x01)        # 7 ret 1
+        b.add_method("run", a.build(), max_stack=1, max_locals=2)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "bad-branch-target")
+        self.assertEqual(res["error"]["offset"], 0)
+
+    def test_aload_of_return_address_rejected(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.branch(0xA8, "c")     # 0 jsr c
+        a.op(0xB1)              # 3 return
+        a.label("c")            # 4
+        a.op(0x4C)              # 4 astore_1 (save return address)
+        a.op(0x2B)              # 5 aload_1 (illegal: returnAddress is not a ref)
+        a.op(0x57)              # 6 pop
+        a.op(0xA9, 0x01)        # 7 ret 1
+        b.add_method("run", a.build(), max_stack=1, max_locals=2)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "type-mismatch")
+        self.assertEqual(res["error"]["offset"], 5)
 
 
 class RejectionTests(unittest.TestCase):

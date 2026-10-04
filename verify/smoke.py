@@ -15,7 +15,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
-from builder import legal_construction_class, uninitialized_escape_class  # noqa: E402
+from builder import (bad_return_address_class, legal_construction_class,
+                     legacy_jsr_cleanup_class, legacy_jsr_wide_class,
+                     legacy_nested_cleanup_class,
+                     uninitialized_escape_class)  # noqa: E402
 
 APP = os.environ.get("APP_URL", "http://app:8080").rstrip("/")
 
@@ -83,6 +86,44 @@ def main():
                   res["handlers"][0]["stack"] == ["ref java/lang/Throwable"])
     check("handler entry state reported", bool(handler_ok),
           f"handlers={res.get('handlers')}")
+
+    # -- Legacy old-javac shared cleanup segments (jsr/jsr_w + astore + ret)
+    legacy = base64.b64encode(legacy_jsr_cleanup_class()).decode("ascii")
+    status, res = post({"class_b64": legacy})
+    states = {s["offset"]: s for s in (res.get("states") or [])}
+    key_offsets = (0, 3, 4, 5, 8, 11, 13, 15)
+    shared_ok = (status == 200 and res.get("ok") is True
+                 and all(states.get(o, {}).get("reachable") for o in key_offsets)
+                 and states.get(11, {}).get("stack") == ["returnAddress(3,8)"]
+                 and states.get(13, {}).get("locals", [None, None])[1]
+                     == "returnAddress(3,8)")
+    check("legacy shared cleanup: two call sites + entry + saved continuation "
+          "+ return points verifiable",
+          bool(shared_ok), f"status={status} res={res}")
+    handler = (res.get("handlers") or [{}])[0]
+    check("legacy cleanup path adjacent to exception table keeps handler state",
+          (handler.get("handler_pc") == 4 and handler.get("reachable")
+           and handler.get("stack") == ["ref java/lang/Throwable"]),
+          f"handlers={res.get('handlers')}")
+
+    for name, fixture in (("wide jsr_w displacement", legacy_jsr_wide_class),
+                          ("nested cleanup segments",
+                           legacy_nested_cleanup_class)):
+        status, res = post({"class_b64": base64.b64encode(fixture()).decode()})
+        check(f"legacy {name} -> ok=true with per-offset states",
+              status == 200 and res.get("ok") is True
+              and len(res.get("states", [])) > 0,
+              f"status={status} res={res}")
+
+    bad_ret = base64.b64encode(bad_return_address_class()).decode("ascii")
+    status, res = post({"class_b64": bad_ret})
+    err = res.get("error") or {}
+    check("illegal return address (ret without jsr save) -> first evidence "
+          "at offset 0",
+          status == 200 and res.get("ok") is False
+          and err.get("kind") == "bad-return-address"
+          and err.get("offset") == 0,
+          f"status={status} res={res}")
 
     bad_class = base64.b64encode(uninitialized_escape_class()).decode("ascii")
     status, res = post({"class_b64": bad_class})

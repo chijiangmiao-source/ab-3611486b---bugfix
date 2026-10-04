@@ -12,8 +12,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.server import make_server  # noqa: E402
-from builder import (ClassBuilder, legal_construction_class,  # noqa: E402
-                     uninitialized_escape_class)
+from builder import (ClassBuilder, bad_return_address_class,
+                     legal_construction_class, legacy_jsr_cleanup_class,
+                     legacy_jsr_wide_class, legacy_nested_cleanup_class,
+                     uninitialized_escape_class)  # noqa: E402
 
 
 def b64(data):
@@ -85,6 +87,38 @@ class ApiTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertEqual(res["error"]["kind"], "uninitialized-escapes-to-handler")
         self.assertEqual(res["error"]["offset"], 4)
+
+    def test_verify_legacy_shared_cleanup_passes(self):
+        # The class that used to fail with unknown-opcode at the first
+        # shared-cleanup entry now verifies, with per-offset states at both
+        # call sites, the cleanup entry and every return point.
+        status, res = self.post({"class_b64": b64(legacy_jsr_cleanup_class())})
+        self.assertEqual(status, 200)
+        self.assertTrue(res.get("ok"), res.get("error"))
+        offsets = {s["offset"]: s for s in res["states"]}
+        for off in (0, 3, 4, 5, 8, 11, 13, 15):
+            self.assertIn(off, offsets)
+            self.assertTrue(offsets[off]["reachable"])
+        self.assertEqual(offsets[11]["stack"], ["returnAddress(3,8)"])
+        self.assertEqual(res["handlers"][0]["handler_pc"], 4)
+        self.assertEqual(res["handlers"][0]["stack"],
+                         ["ref java/lang/Throwable"])
+
+    def test_verify_legacy_wide_and_nested_pass(self):
+        for fixture in (legacy_jsr_wide_class, legacy_nested_cleanup_class):
+            with self.subTest(fixture=fixture.__name__):
+                status, res = self.post(
+                    {"class_b64": b64(fixture())})
+                self.assertEqual(status, 200)
+                self.assertTrue(res.get("ok"), res.get("error"))
+
+    def test_verify_legacy_bad_return_address_rejected(self):
+        status, res = self.post(
+            {"class_b64": b64(bad_return_address_class())})
+        self.assertEqual(status, 200)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "bad-return-address")
+        self.assertEqual(res["error"]["offset"], 0)
 
     def test_base64_with_embedded_whitespace_accepted(self):
         raw = b64(legal_construction_class())
