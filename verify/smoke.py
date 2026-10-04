@@ -15,7 +15,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
-from builder import legal_construction_class, uninitialized_escape_class  # noqa: E402
+from builder import (bad_return_address_class, legal_construction_class,  # noqa: E402
+                     legacy_finally_class, nested_finally_class,
+                     uninitialized_escape_class, wide_jsr_finally_class)
 
 APP = os.environ.get("APP_URL", "http://app:8080").rstrip("/")
 
@@ -91,6 +93,55 @@ def main():
           status == 200 and res.get("ok") is False
           and err.get("kind") == "uninitialized-escapes-to-handler"
           and err.get("offset") == 4,
+          f"status={status} res={res}")
+
+    # --- Old-javac shared cleanup segments (jsr/jsr_w/ret) ----------------
+
+    def state_map(r):
+        return {s["offset"]: s for s in r.get("states", [])}
+
+    legacy = base64.b64encode(legacy_finally_class()).decode("ascii")
+    status, res = post({"class_b64": legacy})
+    sm = state_map(res)
+    key_offsets = all(off in sm and sm[off].get("reachable")
+                      for off in (0, 5, 8, 9, 11, 13, 14))
+    shared_ok = (status == 200 and res.get("ok") is True and key_offsets
+                 and sm.get(9, {}).get("stack") == ["retaddr {@3, @8}"]
+                 and sm.get(11, {}).get("insn") == "ret 1"
+                 and (res.get("handlers") or [{}])[0].get("handler_pc") == 13
+                 and (res.get("handlers") or [{}])[0].get("reachable") is True)
+    check("POST legacy finally class -> ok=true; both call sites share the "
+          "cleanup segment with states and adjacent handler",
+          bool(shared_ok), f"status={status} res={res}")
+
+    wide = base64.b64encode(wide_jsr_finally_class()).decode("ascii")
+    status, res = post({"class_b64": wide})
+    sm = state_map(res)
+    wide_ok = (status == 200 and res.get("ok") is True
+               and sm.get(0, {}).get("insn") == "jsr_w 126"
+               and sm.get(126, {}).get("stack") == ["retaddr @5"]
+               and sm.get(128, {}).get("insn") == "ret 0")
+    check("POST wide jsr_w class -> ok=true with continuation state",
+          bool(wide_ok), f"status={status} res={res}")
+
+    nested = base64.b64encode(nested_finally_class()).decode("ascii")
+    status, res = post({"class_b64": nested})
+    sm = state_map(res)
+    nested_ok = (status == 200 and res.get("ok") is True
+                 and sm.get(10, {}).get("stack") == ["retaddr @8"]
+                 and sm.get(12, {}).get("locals") ==
+                 ["top", "retaddr @3", "retaddr @8"])
+    check("POST nested cleanup class -> ok=true, both continuations tracked",
+          bool(nested_ok), f"status={status} res={res}")
+
+    bad_ret = base64.b64encode(bad_return_address_class()).decode("ascii")
+    status, res = post({"class_b64": bad_ret})
+    err = res.get("error") or {}
+    check("POST illegal return-address class -> ok=false, bad-return-address "
+          "at first accurate offset 2",
+          status == 200 and res.get("ok") is False
+          and err.get("kind") == "bad-return-address"
+          and err.get("offset") == 2,
           f"status={status} res={res}")
 
     status, res = post({"class_b64": "###not-base64###"})

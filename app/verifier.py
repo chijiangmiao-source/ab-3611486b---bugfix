@@ -51,12 +51,24 @@ def UNINIT(offset, cls):
     return ("uninit", offset, cls)
 
 
+def RETADDR(addrs):
+    # A returnAddress produced by jsr/jsr_w.  A cleanup segment shared by
+    # several call sites is analyzed once, so the type may carry a *set* of
+    # continuation offsets (merged from distinct jsr calls); `ret` is legal
+    # only when every candidate is a real jsr continuation of that segment.
+    return ("retaddr", tuple(addrs))
+
+
 def is_uninit(t):
     return t[0] == "uninit"
 
 
 def is_reflike(t):
     return t[0] in ("ref", "null")
+
+
+def is_retaddr(t):
+    return t[0] == "retaddr"
 
 
 def fmt(t) -> str:
@@ -69,6 +81,10 @@ def fmt(t) -> str:
         return f"ref {t[1]}"
     if tag == "uninit":
         return f"uninit(new@{t[1]} {t[2]})"
+    if tag == "retaddr":
+        if len(t[1]) == 1:
+            return f"retaddr @{t[1][0]}"
+        return "retaddr {" + ", ".join(f"@{a}" for a in t[1]) + "}"
     return str(t)
 
 
@@ -86,8 +102,13 @@ def merge_types(a, b):
         # No class hierarchy is available (single class, no field/method
         # resolution); java/lang/Object is a sound common supertype.
         return a if a[1] == b[1] else REF("java/lang/Object")
+    if is_retaddr(a) and is_retaddr(b):
+        # Distinct jsr continuations merge into one returnAddress covering
+        # every call site that shares the cleanup segment.
+        return RETADDR(sorted(set(a[1]) | set(b[1])))
     # uninitialized objects merge only with an identical identity (handled
-    # by the a == b case above); anything else is incompatible.
+    # by the a == b case above); a returnAddress never merges with a value
+    # type; anything else is incompatible.
     return None
 
 
@@ -95,6 +116,10 @@ def merge_types(a, b):
 class Frame:
     locals: tuple
     stack: tuple
+    # Lexically active cleanup segments (jsr subroutines), outermost first;
+    # the last entry is the segment currently executing.  `ret` pops the last
+    # entry and may only return to that segment's own jsr continuations.
+    owners: tuple = ()
 
 
 def merge_frames(fa: Frame, fb: Frame, offset: int) -> Frame:
@@ -103,6 +128,12 @@ def merge_frames(fa: Frame, fb: Frame, offset: int) -> Frame:
             offset, "stack-height-mismatch",
             f"operand stack heights differ at control-flow join: "
             f"{len(fa.stack)} vs {len(fb.stack)}")
+    if fa.owners != fb.owners:
+        raise VerifyError(
+            offset, "incompatible-subroutine",
+            f"the same offset is reachable from different cleanup-segment "
+            f"contexts: {'/'.join(map(str, fa.owners)) or '<top level>'} vs "
+            f"{'/'.join(map(str, fb.owners)) or '<top level>'}")
     locals_out = []
     for i, (x, y) in enumerate(zip(fa.locals, fb.locals)):
         m = merge_types(x, y)
@@ -121,7 +152,7 @@ def merge_frames(fa: Frame, fb: Frame, offset: int) -> Frame:
                 f"operand stack slot {i} has incompatible types at "
                 f"control-flow join: {fmt(x)} vs {fmt(y)}")
         stack_out.append(m)
-    return Frame(tuple(locals_out), tuple(stack_out))
+    return Frame(tuple(locals_out), tuple(stack_out), fa.owners)
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +362,8 @@ def disasm(insn: Insn, cf: ClassFile) -> str:
             return f"{n} {insn.operands[0]}"
         if n in ("iload", "aload", "istore", "astore"):
             return f"{n} {insn.operands[0]}"
+        if n == "ret":
+            return f"ret {insn.operands[0]}"
         if n == "iinc":
             return f"iinc {insn.operands[0]} {insn.operands[1]}"
         if n in ("ldc", "ldc_w", "ldc2_w"):
@@ -375,8 +408,12 @@ class MethodVerifier:
         self.insns: dict[int, Insn] = {}
         self.insns = decode(self.code_attr.code)
         self._validate_exception_table()
+        # jsr/jsr_w target -> sorted tuple of valid continuation offsets
         self.subroutine_entries = self._subroutine_entries()
-
+        # jsr target -> local slots written by that cleanup segment itself
+        self.modified_locals = self._compute_modified_locals()
+        # jsr continuation offset -> caller frame captured at the jsr site
+        self.caller_frames: dict[int, Frame] = {}
     def _validate_exception_table(self) -> None:
         code_len = len(self.code_attr.code)
         for e in self.code_attr.exceptions:
@@ -414,12 +451,87 @@ class MethodVerifier:
         return {target: tuple(sorted(returns))
                 for target, returns in entries.items()}
 
+    # Conditional control-flow (everything with a branch target besides
+    # goto/goto_w/jsr/jsr_w); used only by the static subroutine scan below.
+    _COND = {"ifeq", "ifne", "iflt", "ifge", "ifgt", "ifle",
+             "if_icmpeq", "if_icmpne", "if_icmplt", "if_icmpge",
+             "if_icmpgt", "if_icmple", "if_acmpeq", "if_acmpne",
+             "ifnull", "ifnonnull"}
+
+    def _subroutine_body(self, entry: int):
+        """Instructions making up the cleanup segment entered at `entry`.
+
+        Stops at `ret`/`return`/`athrow`; a jsr keeps the linear continuation
+        (still part of this segment) while its target is reported as a nested
+        segment.  Returns (body offsets, nested segment entry offsets).
+        """
+        seen: set[int] = set()
+        nested: list[int] = []
+        work = [entry]
+        while work:
+            q = work.pop()
+            if q in seen:
+                continue
+            insn = self.insns.get(q)
+            if insn is None:
+                continue
+            seen.add(q)
+            nxt = q + insn.size
+            nm = insn.name
+            if nm in ("ret", "return", "athrow"):
+                continue
+            if nm in ("jsr", "jsr_w"):
+                nested.append(q + insn.operands[0])
+                if nxt in self.insns:
+                    work.append(nxt)
+                continue
+            if nm in ("goto", "goto_w"):
+                t = q + insn.operands[0]
+                if t in self.insns:
+                    work.append(t)
+                continue
+            if nm in self._COND:
+                t = q + insn.operands[0]
+                if t in self.insns:
+                    work.append(t)
+            if nxt in self.insns:
+                work.append(nxt)
+        return seen, nested
+
+    def _compute_modified_locals(self) -> dict:
+        """For each segment entry, the local slots the segment (including any
+        nested segment it calls) assigns.  Only those slots are propagated to
+        the jsr continuation; untouched slots keep the caller's values."""
+        result: dict[int, frozenset] = {}
+
+        def calc(entry):
+            if entry in result:
+                return result[entry]
+            result[entry] = frozenset()  # break nested-call cycles
+            body, nested = self._subroutine_body(entry)
+            mods: set[int] = set()
+            for q in body:
+                nm = self.insns[q].name
+                if nm.startswith("istore") or nm.startswith("astore"):
+                    insn = self.insns[q]
+                    i = insn.operands[0] if insn.operands else int(nm[-1])
+                    mods.add(i)
+            for t in nested:
+                mods |= calc(t)
+            result[entry] = frozenset(mods)
+            return result[entry]
+
+        for entry in self.subroutine_entries:
+            calc(entry)
+        return result
+
     def run(self) -> "MethodVerifier":
         ca = self.code_attr
         if not self.insns:
             raise VerifyError(ca.attr_offset, "empty-code",
                               "method has an empty code array")
         self.frames[0] = Frame((TOP,) * ca.max_locals, ())
+        self.caller_frames = {}
         work = [0]
         steps = 0
         while work:
@@ -433,7 +545,9 @@ class MethodVerifier:
             frame = self.frames[pc]
             insn = self.insns[pc]
             # Exception edges: an exception raised by this instruction
-            # empties the operand stack and keeps the local variables.
+            # empties the operand stack and keeps the local variables.  An
+            # exception abandons any in-flight cleanup segment, so the frame
+            # at the handler runs at the top-level subroutine context.
             for e in ca.exceptions:
                 if e.start_pc <= pc < e.end_pc:
                     for i, t in enumerate(frame.locals):
@@ -448,10 +562,112 @@ class MethodVerifier:
                     catch = (REF("java/lang/Throwable") if e.catch_type == 0
                              else REF(cp_class_name(self.cf, e.catch_type, pc)))
                     self._offer(work, e.handler_pc,
-                                Frame(frame.locals, (catch,)))
+                                Frame(frame.locals, (catch,), ()))
+            # Old-compiler shared cleanup segments: jsr/jsr_w enter a segment
+            # after pushing the continuation; ret resumes each caller.
+            if insn.name in ("jsr", "jsr_w"):
+                for target, nframe in self._jsr_successors(pc, insn, frame):
+                    self._offer(work, target, nframe)
+                continue
+            if insn.name == "ret":
+                for target, nframe in self._ret_successors(pc, insn, frame):
+                    self._offer(work, target, nframe)
+                continue
             for target, nframe in self._successors(pc, insn, frame):
                 self._offer(work, target, nframe)
         return self
+
+    # -- jsr / ret (old-javac finally / shared cleanup segments) ----------
+
+    def _jsr_successors(self, pc: int, insn: Insn, frame: Frame):
+        target = pc + insn.operands[0]
+        cont = pc + insn.size
+        if target not in self.insns:
+            raise VerifyError(
+                pc, "bad-branch-target",
+                f"{insn.name} targets offset {target}, which is not the start "
+                f"of an instruction")
+        if cont not in self.insns:
+            raise VerifyError(
+                pc, "bad-branch-target",
+                f"{insn.name} return address {cont} is not the start of an "
+                f"instruction")
+        if len(frame.stack) + 1 > self.code_attr.max_stack:
+            raise VerifyError(
+                pc, "stack-overflow",
+                f"{insn.name} grows the operand stack to "
+                f"{len(frame.stack) + 1}, max_stack is "
+                f"{self.code_attr.max_stack}")
+        # Remember the caller frame so `ret` can resume with the segment's
+        # own modified locals layered over the untouched caller slots.  A jsr
+        # site may be revisited with a widened frame during convergence.
+        prev = self.caller_frames.get(cont)
+        self.caller_frames[cont] = (frame if prev is None
+                                    else merge_frames(prev, frame, cont))
+        entry = Frame(frame.locals, frame.stack + (RETADDR((cont,)),),
+                      frame.owners + (target,))
+        return [(target, entry)]
+
+    def _ret_successors(self, pc: int, insn: Insn, frame: Frame):
+        i = insn.operands[0]
+        if i >= self.code_attr.max_locals:
+            raise VerifyError(
+                pc, "local-index-out-of-range",
+                f"ret uses local {i} but max_locals is "
+                f"{self.code_attr.max_locals}")
+        t = frame.locals[i]
+        if not is_retaddr(t):
+            raise VerifyError(
+                pc, "bad-return-address",
+                f"ret local {i} does not hold a saved return address "
+                f"(found {fmt(t)}); the cleanup continuation was not stored "
+                f"by the entry astore")
+        if not frame.owners:
+            raise VerifyError(
+                pc, "bad-return-address",
+                f"ret at offset {pc} is reachable without an enclosing jsr; "
+                f"there is no call site to resume ({fmt(t)})")
+        owner = frame.owners[-1]
+        valid = set(self.subroutine_entries.get(owner, ()))
+        addrs = t[1]
+        bad = [a for a in addrs if a not in valid]
+        if bad:
+            raise VerifyError(
+                pc, "bad-return-address",
+                f"ret would resume at {', '.join(map(str, bad))}, but the "
+                f"cleanup segment entered at {owner} can only return to its "
+                f"own jsr continuations {sorted(valid)}")
+        out = []
+        for cont in addrs:
+            caller = self.caller_frames.get(cont)
+            if caller is None:
+                raise VerifyError(
+                    pc, "bad-return-address",
+                    f"return address @{cont} matches no reachable jsr call "
+                    f"site")
+            # The segment must leave the operand stack exactly as it found it
+            # (the pushed return address was consumed by the entry astore).
+            if len(frame.stack) != len(caller.stack):
+                raise VerifyError(
+                    pc, "stack-height-mismatch",
+                    f"cleanup segment leaves {len(frame.stack)} stack slot(s) "
+                    f"at ret but its jsr caller had {len(caller.stack)}; the "
+                    f"stack must be restored before returning")
+            for k, (x, y) in enumerate(zip(frame.stack, caller.stack)):
+                if merge_types(x, y) is None:
+                    raise VerifyError(
+                        pc, "incompatible-types",
+                        f"cleanup segment leaves {fmt(x)} in stack slot {k} "
+                        f"at ret but its jsr caller had {fmt(y)}")
+            # Slots the segment assigns are undefined to the caller on return
+            # (classic subroutine rule): they resume as top.  Untouched slots
+            # keep the caller's values.
+            written = self.modified_locals.get(owner, frozenset())
+            locals_out = tuple(TOP if slot in written else v
+                               for slot, v in enumerate(caller.locals))
+            out.append((cont, Frame(locals_out, caller.stack, caller.owners)))
+        return out
+
 
     def _offer(self, work: list, target: int, nframe: Frame) -> None:
         old = self.frames.get(target)
@@ -532,7 +748,7 @@ class MethodVerifier:
             return t
 
         def out():
-            return Frame(tuple(locals_), tuple(stack))
+            return Frame(tuple(locals_), tuple(stack), frame.owners)
 
         def via_fall():
             return [(fall(), out())]
@@ -580,7 +796,7 @@ class MethodVerifier:
         if n.startswith("aload"):
             i = insn.operands[0] if insn.operands else int(n[-1])
             t = load(i)
-            if not (is_reflike(t) or is_uninit(t)):
+            if not (is_reflike(t) or is_uninit(t) or is_retaddr(t)):
                 err("type-mismatch",
                     f"aload expects local {i} to be a reference, found "
                     f"{fmt(t)}")
@@ -594,9 +810,10 @@ class MethodVerifier:
         if n.startswith("astore"):
             i = insn.operands[0] if insn.operands else int(n[-1])
             t = pop()
-            if not (is_reflike(t) or is_uninit(t)):
+            if not (is_reflike(t) or is_uninit(t) or is_retaddr(t)):
                 err("type-mismatch",
-                    f"astore expects a reference, found {fmt(t)}")
+                    f"astore expects a reference or return address, found "
+                    f"{fmt(t)}")
             store(i, t)
             return via_fall()
         if n == "iinc":

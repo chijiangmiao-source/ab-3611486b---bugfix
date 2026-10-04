@@ -216,3 +216,108 @@ def uninitialized_escape_class():
     b.add_method("run", a.build(), max_stack=2, max_locals=1,
                  exceptions=[(0, 10, 10, 0)])
     return b.build()
+
+
+def legacy_finally_class():
+    """A passing class in the old-javac finally idiom: two jsr call sites
+    reuse one shared cleanup segment, which saves the continuation in a
+    local and returns via ret.  A catch-all handler sits adjacent to the
+    exception table.
+
+      0 jsr C            (continuation 3)
+      3 iconst_0         (normal work between the two call sites)
+      4 pop
+      5 jsr C            (continuation 8)
+      8 return
+      9 astore_1         C: save returnAddress
+     10 nop              (cleanup body)
+     11 ret 1            (resume the matching continuation)
+     13 pop              h: catch-all handler
+     14 return
+
+    exception table: (0, 9, 13, 0)
+    """
+    b = ClassBuilder("Legacy")
+    a = Asm()
+    a.branch(0xA8, "clean")  # 0 jsr clean  -> cont 3
+    a.op(0x03)               # 3 iconst_0
+    a.op(0x57)               # 4 pop
+    a.branch(0xA8, "clean")  # 5 jsr clean  -> cont 8
+    a.op(0xB1)               # 8 return
+    a.label("clean")         # 9
+    a.op(0x4C)               # 9 astore_1 (save continuation)
+    a.op(0x00)               # 10 nop (cleanup work)
+    a.op(0xA9, 0x01)         # 11 ret 1
+    a.label("h")             # 13
+    a.op(0x57)               # 13 pop
+    a.op(0xB1)               # 14 return
+    b.add_method("run", a.build(), max_stack=1, max_locals=2,
+                 exceptions=[(0, 9, 13, 0)])
+    return b.build()
+
+
+def wide_jsr_finally_class():
+    """The same shared-segment idiom entered with the 4-byte jsr_w form
+    (wide displacement), with a block of nops between the call and the
+    segment so the branch leaves the jsr/jsr_w operand machinery exercised."""
+    b = ClassBuilder("LegacyWide")
+    a = Asm()
+    a.branch(0xC9, "clean", wide=True)  # 0 jsr_w clean -> cont 5
+    for _ in range(120):
+        a.op(0x00)                      # 5..124 nop
+    a.op(0xB1)                          # 125 return
+    a.label("clean")                    # 126
+    a.op(0x4B)                          # 126 astore_0 (save continuation)
+    a.op(0x00)                          # 127 nop (cleanup work)
+    a.op(0xA9, 0x00)                    # 128 ret 0
+    b.add_method("run", a.build(), max_stack=1, max_locals=1)
+    return b.build()
+
+
+def nested_finally_class():
+    """A passing class with a cleanup segment that itself calls a nested
+    cleanup segment; the two saved continuations live in distinct locals."""
+    b = ClassBuilder("LegacyNested")
+    a = Asm()
+    a.branch(0xA8, "outer")  # 0 jsr outer -> cont 3
+    a.op(0xB1)               # 3 return
+    a.label("outer")         # 4
+    a.op(0x4C)               # 4 astore_1 (outer continuation)
+    a.branch(0xA8, "inner")  # 5 jsr inner -> cont 8
+    a.op(0xA9, 0x01)         # 8 ret 1 (resume outer's caller)
+    a.label("inner")         # 10
+    a.op(0x4D)               # 10 astore_2 (inner continuation)
+    a.op(0x00)               # 11 nop (inner cleanup work)
+    a.op(0xA9, 0x02)         # 12 ret 2 (resume inside outer)
+    b.add_method("run", a.build(), max_stack=1, max_locals=3)
+    return b.build()
+
+
+def bad_return_address_class():
+    """A rejected class: ret reads a local that holds an int instead of a
+    saved return address (the cleanup continuation was never stored)."""
+    b = ClassBuilder("BadRet")
+    a = Asm()
+    a.op(0x03)               # 0 iconst_0
+    a.op(0x3D)               # 1 istore_2
+    a.op(0xA9, 0x02)         # 2 ret 2  (local 2 is int, not returnAddress)
+    b.add_method("run", a.build(), max_stack=1, max_locals=3)
+    return b.build()
+
+
+def cross_segment_return_class():
+    """A rejected class: the inner segment returns through the OUTER
+    segment's saved continuation, which never called the inner segment."""
+    b = ClassBuilder("CrossRet")
+    a = Asm()
+    a.branch(0xA8, "outer")  # 0 jsr outer -> cont 3
+    a.op(0xB1)               # 3 return
+    a.label("outer")         # 4
+    a.op(0x4C)               # 4 astore_1 (outer continuation = 3)
+    a.branch(0xA8, "inner")  # 5 jsr inner -> cont 8
+    a.op(0xA9, 0x01)         # 8 ret 1
+    a.label("inner")         # 10
+    a.op(0x4D)               # 10 astore_2 (inner continuation = 8)
+    a.op(0xA9, 0x01)         # 11 ret 1  <-- resumes 3, but inner must resume 8
+    b.add_method("run", a.build(), max_stack=1, max_locals=3)
+    return b.build()

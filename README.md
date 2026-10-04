@@ -20,6 +20,11 @@
   - **不得与已初始化引用合并**（汇合冲突 → 拒绝）；
   - `invokespecial <init>` 成功后，同一 `new` 身份的所有副本（局部变量 + 栈）一并初始化；
 - 控制流汇合时槽位数量与类型必须兼容（栈高不一致 / 类型不兼容 → 拒绝）；
+- 旧版编译器的共享清理段（`finally`）经 `jsr`/`jsr_w` 进入、在局部变量中保存
+  续执行位置（`returnAddress`）、再由 `ret` 回到各自调用点：多个调用点复用同一
+  清理段时合并其续执行位置，嵌套清理段按调用栈逐层返回，段内改写的局部变量在
+  返回后按 `top` 处理；`ret` 取到非 `returnAddress`、或回到不属于本清理段的
+  调用点 → `bad-return-address`；
 - 稳定定位字节偏移的结构性拒绝：截断属性 / 截断指令、跳入指令中部、
   无效处理器范围（越界、空区间、未对齐指令边界）、栈高不一致、无法收敛
   （分析步数保险丝，默认 200000 步）；
@@ -29,7 +34,8 @@
 
 - 目标方法：静态 `()V`（多个时需用 `method` 字段指定）；无字段访问；
 - 指令集：常量（`iconst`/`bipush`/`sipush`/`ldc`）、`iload/aload/istore/astore` 系列、
-  `iinc`、int 运算、`pop/dup`、分支（`if*`/`goto`/`goto_w`）、`new`、
+  `iinc`、int 运算、`pop/dup`、分支（`if*`/`goto`/`goto_w`）、
+  旧版共享清理段（`jsr`/`jsr_w`/`ret`）、`new`、
   `invokespecial <init>`、`athrow`、`return`、异常表；
 - 越出范围的指令 / 常量按 `unknown-opcode` / `unsupported-*` 拒绝并定位偏移。
 
@@ -64,6 +70,7 @@
 `incompatible-types`、`uninitialized-escapes-to-handler`、
 `uninitialized-object-used`、`already-initialized`、`stack-underflow` /
 `stack-overflow`、`local-index-out-of-range`、`fall-off-end`、
+`bad-return-address`、`incompatible-subroutine`、
 `unknown-opcode`、`non-converging`、`no-target-method` / `ambiguous-method`。
 
 ## 运行（Docker Compose）
@@ -85,7 +92,7 @@ HOST_PORT=9090 docker compose up app
 ## 本地开发（无 Docker）
 
 ```bash
-python3 -m unittest discover -s tests -v     # 47 个单元/API 测试
+python3 -m unittest discover -s tests -v     # 56 个单元/API 测试
 PORT=8080 python3 -m app.server &            # 启动服务
 APP_URL=http://127.0.0.1:8080 python3 verify/smoke.py   # 冒烟
 ```

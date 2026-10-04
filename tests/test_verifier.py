@@ -8,7 +8,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.verifier import verify_class  # noqa: E402
 from builder import (ACC_PUBLIC, ACC_STATIC, Asm, ClassBuilder,  # noqa: E402
-                     legal_construction_class, uninitialized_escape_class)
+                     bad_return_address_class, cross_segment_return_class,
+                     legacy_finally_class, nested_finally_class,
+                     legal_construction_class, uninitialized_escape_class,
+                     wide_jsr_finally_class)
 
 DIAG = "com/acme/Diag"
 
@@ -433,6 +436,141 @@ class RejectionTests(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertEqual(res["error"]["kind"], "non-converging")
         self.assertIsInstance(res["error"]["offset"], int)
+
+
+class LegacySubroutineTests(unittest.TestCase):
+    """Old-javac finally: jsr/jsr_w enter a shared cleanup segment, which
+    saves the continuation and resumes via ret."""
+
+    def test_two_call_sites_share_cleanup_segment(self):
+        res = verify_class(legacy_finally_class())
+        self.assertTrue(res["ok"], res.get("error"))
+        by = {s["offset"]: s for s in res["states"]}
+        # Both call sites, the segment entry, the saved continuation and the
+        # return points are all reachable with reviewable entry states.
+        for off in (0, 5, 8, 9, 11, 13, 14):
+            self.assertTrue(by[off]["reachable"], off)
+        # Segment entry sees a returnAddress merged from both jsr sites.
+        self.assertEqual(by[9]["insn"], "astore_1")
+        self.assertEqual(by[9]["stack"], ["retaddr {@3, @8}"])
+        # astore_1 saved the continuation; ret reads it back.
+        self.assertEqual(by[11]["insn"], "ret 1")
+        self.assertEqual(by[11]["locals"], ["top", "retaddr {@3, @8}"])
+        self.assertEqual(by[11]["stack"], [])
+        # The normal return after each call site resumes with no RA leaked.
+        self.assertEqual(by[8]["stack"], [])
+        # Adjacent catch-all handler is reachable on the exception edge.
+        self.assertEqual(len(res["handlers"]), 1)
+        h = res["handlers"][0]
+        self.assertEqual((h["start_pc"], h["end_pc"], h["handler_pc"]),
+                         (0, 9, 13))
+        self.assertTrue(h["reachable"])
+        self.assertEqual(h["stack"], ["ref java/lang/Throwable"])
+
+    def test_wide_jsr_w_displacement(self):
+        res = verify_class(wide_jsr_finally_class())
+        self.assertTrue(res["ok"], res.get("error"))
+        by = {s["offset"]: s for s in res["states"]}
+        self.assertEqual(by[0]["insn"], "jsr_w 126")
+        self.assertEqual(by[126]["stack"], ["retaddr @5"])
+        self.assertEqual(by[128]["insn"], "ret 0")
+        self.assertTrue(by[125]["reachable"])  # normal return past the nops
+
+    def test_nested_cleanup_segments(self):
+        res = verify_class(nested_finally_class())
+        self.assertTrue(res["ok"], res.get("error"))
+        by = {s["offset"]: s for s in res["states"]}
+        # Outer continuation held in local 1 while the inner segment runs.
+        self.assertEqual(by[10]["locals"],
+                         ["top", "retaddr @3", "top"])
+        self.assertEqual(by[10]["stack"], ["retaddr @8"])
+        self.assertEqual(by[12]["locals"],
+                         ["top", "retaddr @3", "retaddr @8"])
+        self.assertEqual(by[8]["insn"], "ret 1")
+        self.assertEqual(by[12]["insn"], "ret 2")
+        # Every call / entry / save / return offset is reachable.
+        for off in (0, 3, 4, 5, 8, 10, 12):
+            self.assertTrue(by[off]["reachable"], off)
+
+    def test_segment_modified_local_is_top_on_resume(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.op(0x01)              # 0 aconst_null
+        a.op(0x4B)              # 1 astore_0
+        a.branch(0xA8, "c")     # 2 jsr c (cont 5)
+        a.op(0x2A)              # 5 aload_0  -- slot 0 was written by segment
+        a.op(0xB1)              # 6 return
+        a.label("c")            # 7
+        a.op(0x4C)              # 7 astore_1
+        a.op(0x01)              # 8 aconst_null
+        a.op(0x4B)              # 9 astore_0  (segment overwrites slot 0)
+        a.op(0xA9, 0x01)        # 10 ret 1
+        b.add_method("run", a.build(), max_stack=1, max_locals=2)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "type-mismatch")
+        self.assertEqual(res["error"]["offset"], 5)
+
+    def test_ret_without_saved_return_address_rejected(self):
+        res = verify_class(bad_return_address_class())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "bad-return-address")
+        self.assertEqual(res["error"]["offset"], 2)
+
+    def test_cross_segment_return_rejected(self):
+        res = verify_class(cross_segment_return_class())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "bad-return-address")
+        self.assertEqual(res["error"]["offset"], 11)
+        self.assertIn("3", res["error"]["message"])
+
+    def test_jsr_into_instruction_middle_rejected(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.branch(0xA8, "mid")   # 0 jsr mid -> offset 5
+        a.op(0xB1)              # 3 return
+        a.op(0x10)              # 4 bipush opcode
+        a.label("mid")          # 5: bipush operand byte (instruction middle)
+        a.op(0x05)              # 5
+        a.op(0xB1)              # 6 return
+        b.add_method("run", a.build(), max_stack=1, max_locals=0)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "bad-branch-target")
+        self.assertEqual(res["error"]["offset"], 0)
+        self.assertIn("offset 5", res["error"]["message"])
+
+    def test_ret_local_out_of_range_rejected(self):
+        b = ClassBuilder()
+        a = Asm()
+        a.branch(0xA8, "c")     # 0 jsr c
+        a.op(0xB1)              # 3 return
+        a.label("c")            # 4
+        a.op(0x4B)              # 4 astore_0
+        a.op(0xA9, 0x05)        # 5 ret 5 (max_locals is 1)
+        b.add_method("run", a.build(), max_stack=1, max_locals=1)
+        res = verify_class(b.build())
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "local-index-out-of-range")
+        self.assertEqual(res["error"]["offset"], 5)
+
+    def test_jsr_continuations_have_states_even_when_unshared(self):
+        # A single jsr site still gets a reviewable continuation state.
+        b = ClassBuilder()
+        a = Asm()
+        a.branch(0xA8, "c")     # 0 jsr c (cont 3)
+        a.op(0x03)              # 3 iconst_0
+        a.op(0x57)              # 4 pop
+        a.op(0xB1)              # 5 return
+        a.label("c")            # 6
+        a.op(0x4B)              # 6 astore_0
+        a.op(0xA9, 0x00)        # 7 ret 0
+        b.add_method("run", a.build(), max_stack=1, max_locals=1)
+        res = verify_class(b.build())
+        self.assertTrue(res["ok"], res.get("error"))
+        by = {s["offset"]: s for s in res["states"]}
+        self.assertEqual(by[6]["stack"], ["retaddr @3"])
+        self.assertTrue(by[3]["reachable"])
 
 
 class MethodSelectionTests(unittest.TestCase):
